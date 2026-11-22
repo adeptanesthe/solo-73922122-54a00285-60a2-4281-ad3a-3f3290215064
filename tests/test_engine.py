@@ -151,3 +151,57 @@ def test_empty_line_has_empty_reading():
     assert res.total_score == 0
     assert res.ordered_ids == []
     assert res.review_ids == set()
+
+
+# 与 _corpus 相同的一组候选，坐标等比例放大 scale 倍
+def _scaled_corpus(scale):
+    return [
+        _w(1, 0, 2 * scale, "天氣", 5),
+        _w(2, 2 * scale, 4 * scale, "晴朗", 5),
+        _w(3, 0, 1 * scale, "天", 3),
+        _w(4, 1 * scale, 4 * scale, "氣晴朗", 6),
+        _w(5, 0, 4 * scale, "天氣晴朗", 4),
+    ]
+
+
+def test_sparse_coordinates_same_result_at_any_scale():
+    # 同一组候选坐标等比例放大：最高分读法、同分取舍、分差待核都不变
+    for scale in (1, 10**3, 10**6):
+        res = engine.compute_result(4 * scale, _scaled_corpus(scale), 1, set())
+        assert res.feasible
+        assert res.total_score == 10
+        assert res.ordered_ids == [1, 2]
+        assert res.review_ids == {1, 2}
+
+
+def test_decode_traversal_does_not_grow_with_coordinate_span():
+    # 解码只访问“有词可达”的位置：坐标等比例放大，遍历量不变
+    visits = []
+    for scale in (1, 10**3, 10**6, 10**9):
+        stats = {}
+        res = engine.compute_result(
+            4 * scale, _scaled_corpus(scale), 1, set(), stats=stats
+        )
+        assert res.ordered_ids == [1, 2]
+        visits.append(stats["positions"])
+    assert len(set(visits)) == 1  # 各放大倍数下访问的位置数完全相同
+
+
+def test_huge_sparse_line_decodes():
+    # 行尾 10**9、全行只有 4 个候选：逐坐标遍历的旧实现会卡住，
+    # 现在只访问有词的少数位置
+    words = [
+        _w(1, 0, 400_000_000, "甲", 7),
+        _w(2, 400_000_000, 1_000_000_000, "乙", 7),
+        _w(3, 0, 1_000_000_000, "丙", 4),
+        _w(4, 100_000_000, 200_000_000, "丁", 1),
+    ]
+    res = engine.compute_result(1_000_000_000, words, 1, set())
+    assert res.feasible
+    assert res.ordered_ids == [1, 2]
+    assert res.total_score == 14
+    # 唯一替代读法 3 号差 10 分，超出分差 1：两个词都不待核
+    assert res.review_ids == set()
+    # 分差放宽到 10：4 分的整词读法进入分差，两个词都待核
+    res2 = engine.compute_result(1_000_000_000, words, 10, set())
+    assert res2.review_ids == {1, 2}

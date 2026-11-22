@@ -10,6 +10,7 @@ start），恰好到达行尾 line_end，并包含全部已确认词。
 """
 from __future__ import annotations
 
+import heapq
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Set, Tuple
 
@@ -108,21 +109,29 @@ def segment_best(
     by_start: Dict[int, List[Word]],
     forbidden: Set[int],
     boundary_breaks: Optional[Set[int]] = None,
+    stats: Optional[dict] = None,
 ) -> Optional[Tuple[int, Tuple[int, ...]]]:
     """在自由段 [lo, hi) 内求最优拼合；不可达返回 None。
 
     返回 (总分, 按顺序的候选编号元组)。
     forbidden 中的词不可使用；boundary_breaks 中的位置是确认词边界，
     任何跨过边界的词也不可使用（替代读法不能越过已确认词）。
+
+    位置 DP 只访问“有词可达”的位置：用最小堆按坐标升序弹出，每个
+    可达位置入堆、弹出各一次，每条候选边松弛一次。遍历量与候选词数
+    成正比，与坐标跨度无关——同一组候选的坐标等比例放大多少倍，
+    访问的位置数都不变（stats["positions"] 可观测，供测试与演示）。
     """
     if lo == hi:
         return (0, ())
     breaks = boundary_breaks or set()
     dp: Dict[int, Tuple[int, Tuple[int, ...]]] = {lo: (0, ())}
-    for pos in range(lo, hi):
-        state = dp.get(pos)
-        if state is None:
-            continue
+    heap = [lo]
+    while heap:
+        pos = heapq.heappop(heap)
+        if stats is not None:
+            stats["positions"] = stats.get("positions", 0) + 1
+        state = dp[pos]
         for w in by_start.get(pos, ()):
             if w.id in forbidden or w.end > hi:
                 continue
@@ -130,7 +139,14 @@ def segment_best(
             if any(lo < b < w.end for b in breaks):
                 continue
             cand = (state[0] + w.score, state[1] + (w.id,))
-            dp[w.end] = _better(cand, dp.get(w.end))
+            nxt = dp.get(w.end)
+            if nxt is None:
+                # 首次到达该位置：入堆。w.end > pos，而堆按升序弹出，
+                # 故它弹出时所有前驱（坐标都更小）已松弛完，dp[w.end] 即最终值
+                dp[w.end] = cand
+                heapq.heappush(heap, w.end)
+            else:
+                dp[w.end] = _better(cand, nxt)
     return dp.get(hi)
 
 
@@ -149,8 +165,13 @@ def compute_result(
     words: Sequence[Word],
     score_gap: int,
     confirmed_ids: Set[int],
+    stats: Optional[dict] = None,
 ) -> Result:
-    """依据当前已生效确认项重算读法与待核标记。"""
+    """依据当前已生效确认项重算读法与待核标记。
+
+    stats 不为 None 时，把各自由段位置 DP 的遍历量累计进去
+    （观测用，不影响结果）。
+    """
     by_id = {w.id: w for w in words}
     try:
         confirmed = sorted(
@@ -184,7 +205,7 @@ def compute_result(
     pieces: List[Tuple[int, Tuple[int, ...]]] = []
     cursor = 0
     for cw in confirmed:
-        seg = segment_best(cursor, cw.start, by_start, set(), breaks)
+        seg = segment_best(cursor, cw.start, by_start, set(), breaks, stats)
         if seg is None:
             return Result(
                 False, None, [], set(),
@@ -195,7 +216,7 @@ def compute_result(
         pieces.append(seg)
         pieces.append((cw.score, (cw.id,)))
         cursor = cw.end
-    tail = segment_best(cursor, line_end, by_start, set(), breaks)
+    tail = segment_best(cursor, line_end, by_start, set(), breaks, stats)
     if tail is None:
         return Result(
             False, None, [], set(),
@@ -221,7 +242,7 @@ def compute_result(
             if lo <= w.start and w.end <= hi
         )
         lo, hi, seg_best_score, _ = free_segments[seg_idx]
-        alt = segment_best(lo, hi, by_start, {cid}, breaks)
+        alt = segment_best(lo, hi, by_start, {cid}, breaks, stats)
         if alt is None:
             continue  # 不含此词就拼不成整行：不存在缺少它的合法读法
         alt_total = total - seg_best_score + alt[0]

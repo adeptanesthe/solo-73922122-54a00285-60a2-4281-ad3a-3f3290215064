@@ -101,3 +101,48 @@ def test_parallel_conflicting_confirms_single_winner(server):
     assert len(confirmed) == 1
     assert set(confirmed).issubset({1, 3})
     assert final["feasible"] is True
+
+
+def test_sparse_line_and_cross_task_parallel_confirms(server):
+    # 稀疏行：同一组候选坐标放大 10**6 倍，真实服务下建行与确认照常
+    scale = 10**6
+    sparse = [
+        dict(c, start=c["start"] * scale, end=c["end"] * scale) for c in CORPUS
+    ]
+    t0 = time.monotonic()
+    r = httpx.post(f"{server}/tasks", json={
+        "line_end": 4 * scale, "score_gap": 1, "candidates": sparse,
+    }, timeout=10)
+    assert r.status_code == 201
+    heavy_tid = r.json()["task_id"]
+    assert [w["id"] for w in r.json()["reading"]["words"]] == [1, 2]
+
+    # 再起 4 个普通行，和稀疏行一起做并发校对
+    light_tids = []
+    for _ in range(4):
+        rr = httpx.post(f"{server}/tasks", json={
+            "line_end": 4, "score_gap": 1, "candidates": CORPUS,
+        }, timeout=10)
+        assert rr.status_code == 201
+        light_tids.append(rr.json()["task_id"])
+
+    def confirm(tid: int) -> str:
+        resp = httpx.post(
+            f"{server}/tasks/{tid}/confirmations",
+            json={"candidate_id": 3}, timeout=30,
+        )
+        assert resp.status_code == 200, resp.text
+        return resp.json()["status"]
+
+    import concurrent.futures
+    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as pool:
+        statuses = list(pool.map(confirm, [heavy_tid] + light_tids))
+
+    assert all(s == "accepted" for s in statuses)
+    elapsed = time.monotonic() - t0
+    # 坐标跨度没有拖慢建行与并发校对（旧实现仅稀疏行建行就需数秒）
+    assert elapsed < 10
+    for tid in [heavy_tid] + light_tids:
+        final = httpx.get(f"{server}/tasks/{tid}", timeout=10).json()
+        assert final["revision"] == 1
+        assert [w["id"] for w in final["reading"]["words"]] == [3, 4]
